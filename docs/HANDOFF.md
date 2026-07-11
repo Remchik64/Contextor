@@ -1,10 +1,9 @@
-# 📋 Записка для следующего чата — Contextor Development Context
+# Записка для следующего чата — Contextor Development Context
 
-> Дата: 2026-05-16
-> Создал: Agent Zero (developer profile)
-> Проект: https://github.com/Remchik64/Contextor-pro (активная разработка)
-> Архив: https://github.com/Remchik64/pure-intellect (только чтение)
-> Локальная копия: /a0/usr/workdir/pure-intellect/ (пакет переименован в contextor)
+> Дата создания: 2026-05-16
+> Обновлено: 2026-07-11 (docs/cleanup-and-update)
+> Репо: https://github.com/Remchik64/Contextor (бывший Contextor-pro, переименован)
+> Локальная копия: /a0/usr/workdir/Contextor/
 
 ---
 
@@ -116,64 +115,87 @@ CTX инжектирует не только координату, а **4-сло
 
 ---
 
-## 🔑 Ключевые файлы проекта
+## Ключевые файлы проекта
+
+> Размеры актуальны на 2026-07-11 (HEAD `ce7ec97`). Обновляются при изменениях.
 
 | Файл | Строки | Описание |
-|------|--------|----------|
-| `src/contextor/core/orchestrator.py` | 908 | Главный пайплайн, Soft Reset, координаты |
-| `src/contextor/api/routes.py` | 17 | Роутер-хаб (делегирует в модули) |
-| `src/contextor/api/chat.py` | 42 | Chat API эндпоинты |
-| `src/contextor/api/session.py` | 31 | Session API эндпоинты |
-| `src/contextor/api/memory_api.py` | 43 | Memory API эндпоинты |
-| `src/contextor/api/models_api.py` | 310 | Models API (status, switch, download) |
-| `src/contextor/api/system.py` | 353 | System API (health, config, hardware, OpenAI) |
+|------|-------:|----------|
+| `src/contextor/core/orchestrator.py` | 928 | Главный пайплайн, Soft Reset, координаты, run_stream() |
+| `src/contextor/core/dual_model.py` | 345 | Маршрутизация Coordinator/Generator |
+| `src/contextor/core/intent.py` | 308 | Intent detection |
+| `src/contextor/core/session_manager.py` | 400 | Управление сессиями |
+| `src/contextor/core/session.py` | 223 | Persistence одной сессии |
+| `src/contextor/core/assembler.py` | 162 | Сборка контекста |
+| `src/contextor/core/memory/storage.py` | 588 | WARM хранилище (ChromaDB + SentenceTransformer) |
+| `src/contextor/core/memory/working_memory.py` | 396 | HOT буфер |
+| `src/contextor/core/memory/meta_coordinator.py` | 254 | Мета-координаты |
+| `src/contextor/api/system.py` | 457 | System API (health, config, hardware, OpenAI) |
 | `src/contextor/api/websocket.py` | 358 | WebSocket стриминг |
-| `src/contextor/api/schemas.py` | 37 | Pydantic модели для API |
-| `src/contextor/api/state.py` | 56 | Глобальное состояние пайплайна |
-| `src/contextor/core/dual_model.py` | 325 | Маршрутизация Coordinator/Generator |
+| `src/contextor/api/models_api.py` | 310 | Models API (status, switch, download) |
+| `src/contextor/api/session.py` | 198 | Session API эндпоинты |
+| `src/contextor/api/state.py` | 74 | Глобальное состояние пайплайна |
+| `src/contextor/api/memory_api.py` | 50 | Memory API эндпоинты |
+| `src/contextor/api/schemas.py` | 48 | Pydantic модели |
+| `src/contextor/api/chat.py` | 42 | Chat API эндпоинты |
+| `src/contextor/api/routes.py` | 17 | Роутер-хаб |
+| `src/contextor/server.py` | 255 | FastAPI сервер, startup/shutdown |
 | `src/contextor/utils/swap_manager.py` | 200 | VRAM Swap Manager |
-| `src/contextor/core/memory/working_memory.py` | 396 | Рабочая память (HOT) |
-| `src/contextor/core/memory/meta_coordinator.py` | 254 | Мета-координаты (сжатие координат) |
-| `src/contextor/config.py` | 76 | Конфигурация (Pydantic Settings, ollama_url) |
-| `src/contextor/server.py` | 243 | FastAPI сервер, startup/shutdown |
-| `src/contextor/static/index.html` | 341 | Web UI HTML |
-| `src/contextor/static/css/style.css` | 1040 | Web UI стили |
-| `src/contextor/static/js/app.js` | 1075 | Web UI JavaScript |
+| `src/contextor/static/index.html` | 332 | Web UI HTML |
+| `src/contextor/static/css/style.css` | ~1040 | Web UI стили |
+| `src/contextor/static/js/app.js` | ~1075 | Web UI JavaScript |
 
 ---
 
-## ⚠️ Известные проблемы
+## ⚠️ Состояние проблем
 
-1. **Coordinator prompt на русском** — для Module Mode нужен английский
-2. **Нет proxy pipeline** — основная задача Фазы 2
-3. **Нет UCIP v2** — координаты генерируются в русском шаблонном формате
-4. **CCI threshold фиксированный (0.55)** — нужен adaptive
-5. **Задержка ответа ~25 сек** — pipeline.run() синхронный, ответ появляется целиком
-6. **После перезапуска сервера нужен F5** — WebSocket не переподключается автоматически
-7. **Тесты модели** — test_config/test_tagger/test_hardware_detector ждут старые имена qwen2.5, код использует qwen3.5
+### Уже решено
+- ~~Задержка ~25 сек~~ — есть `run_stream()` в `core/orchestrator.py`, стриминг через WebSocket
+- ~~routes.py 1976 строк → модули~~ — выполнено в `5aa4777`, теперь 17 строк + 10 модулей api/
+- ~~qwen2.5/qwen3.5 в тестах~~ — обновлено в `5aa4777`
+- ~~мёртвый код (5 модулей, ~30 эндпоинтов, 6 тестов)~~ — удалён в `5aa4777`, см. `CLEANUP_HISTORY.md`
+
+### Активные
+- **Координата на русском** — `core/orchestrator.py:170-172`: шаблон «УЧАСТНИК/ПРОЕКТ/ТЕХНОЛОГИИ/ЦЕЛЬ», UCIP v2 (английский, 4-слойный Context Package) ещё не реализован
+- **`engine/` (singular, legacy) vs `engines/` (plural, active)** — путаница; `engine/` остался только в `__main__.py` для CLI
+- **README claims без воспроизводимых бенчмарков** — «85% fewer tokens», «100% recall», «5ms/fact»; `benchmarks/runner.py` — заготовка, не подключена к pytest
+- **Module Mode (proxy pipeline)** — Фаза 2 по ROADMAP, не начата
+- **CCI threshold фиксированный (0.55)** — нужен adaptive
+- **WebSocket auto-reconnect** — после перезапуска сервера клиент может требовать F5
 
 ---
 
-## 🚀 Следующий шаг
+## 🚀 Следующие задачи (в порядке убывания ценности)
 
-**Продолжить реализацию Фазы 1 — Стабильность ядра:**
-1. Обновить тесты под текущие имена моделей (qwen3.5 вместо qwen2.5)
-2. Переписать _create_coordinate() на английский (UCIP format)
-3. Добавить 4-слойный Context Package в _build_system_prompt()
-4. Улучшить CCI алгоритм (adaptive threshold)
-5. Асинхронный pipeline.run() для стриминга ответов
-6. WebSocket auto-reconnect на клиенте
+1. **UCIP v2** — переписать `_create_coordinate()` на английском + 4-слойный Context Package
+2. **Зелёные тесты** — `pytest tests/`, починить или `@pytest.mark.skip(reason=...)`
+3. **Engine cleanup** — решить судьбу `engine/` (legacy), переписать `__main__.py`
+4. **Реальные бенчмарки** — подключить `benchmarks/runner.py`, обновить README.md реальными цифрами
+5. **Module Mode** — HTTP proxy + Decision Engine + интеграции (большая фаза)
 
-Для начала работы прочитать:
-- `docs/CTX_MODULE_ARCHITECTURE.md` — полная архитектура Module Mode
-- `docs/ROADMAP.md` — дорожная карта с задачами
-- `docs/architecture.md` — оригинальная архитектура проекта
-- `src/contextor/core/orchestrator.py` — ядро (908 строк)
+Опционально: CCI adaptive threshold, WebSocket auto-reconnect на клиенте.
+
+Для входа в работу:
+- `docs/CTX_MODULE_ARCHITECTURE.md` — Module Mode и UCIP v2
+- `docs/ROADMAP.md` — план по фазам
+- `docs/architecture.md` — текущая архитектура
+- `src/contextor/core/orchestrator.py` — ядро (928 строк)
+- `src/contextor/core/memory/storage.py` — ChromaDB + SentenceTransformer (588 строк)
  
  ---
  
  ## 📝 Дневник разработки
  
+### 11 июля 2026 — Documentation refresh
+
+**Выполнено:**
+
+- `docs/DEAD_CODE_AUDIT.md` → `docs/CLEANUP_HISTORY.md` (историческая справка, не описание текущих проблем)
+- `docs/architecture.md`: убран «5. Code Module», добавлен «5. Memory Subsystem», убрано Code Module из потока данных и File Watcher из admin panel
+- `docs/HANDOFF.md`: обновлены заголовок, проблемы (Решённые/Активные), следующие задачи, таблица файлов, добавлена эта запись в дневник
+
+**Ветка:** `docs/cleanup-and-update`. HEAD до: `ce7ec97`.
+
 ### 18 мая 2026 — Книга-рассказ о Contextor
 
 **Выполнено:**

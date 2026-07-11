@@ -77,16 +77,28 @@ Metric (0.0–1.0) которая отслеживает смысловую св
 
 **Файл:** `core/dual_model.py`
 
-### 5. Code Module (✅ Рабочий)
+### 5. Memory Subsystem (✅ Рабочая)
 
-- Индексирует Python проекты в ChromaDB
-- При запросе — семантически ищет релевантный код и инжектирует в промпт (RAG)
-- File Watcher: автоматически переиндексирует файлы при изменении
-- Code-Aware Memory: факты о коде автоматически сохраняются в HOT память
+Полная подсистема памяти в `core/memory/`:
 
-**Файлы:** `core/code_module.py`, `core/code_memory.py`, `core/watcher.py`
+- **WorkingMemory** — HOT буфер, активные факты (importance-weighted)
+- **MemoryStorage** — WARM долгосрочное хранилище (ChromaDB + embeddings)
+- **Scorer** (`scorer.py`) — AttentionScorer: считает важность фактов
+- **Tagger** (`tagger.py`) — ImportanceTagger: LLM-классификация фактов (anchors / facts / transient)
+- **MetaCoordinator** (`meta_coordinator.py`) — управляет ростом координат (каждые 4 → мета-координата)
+- **Optimizer** (`optimizer.py`) — фоновый промоут/compress/archive
+- **Fact** (`fact.py`) — атом памяти с attention_weight + is_anchor + stability
+- **CCI Tracker** (`cci.py`) — Context Coherence Index
 
-### 6. OpenAI-Compatible API (✅ Рабочий)
+Каждый факт защищён `is_anchor` от eviction. Facts имеют жизненный цикл RAW → SUMMARIZED → ENTITY_ONLY → ARCHIVED.
+
+### 6. Parsers & Knowledge Graph (✅ Рабочий)
+
+- `core/graph.py` + `core/graph_builder.py` — Knowledge Graph
+- `parsers/python_parser.py` (tree-sitter-based) парсит Python код в CodeEntity + CodeCard
+- `core/card_generator.py` генерирует карточки кода
+
+### 7. OpenAI-Compatible API (✅ Рабочий)
 
 Сервер принимает запросы в стандартном OpenAI формате:
 - `POST /v1/chat/completions` — основной эндпоинт
@@ -102,7 +114,7 @@ Metric (0.0–1.0) которая отслеживает смысловую св
 - Dashboard с GPU/CCI/память метриками в реалтайм
 - Управление моделями, скачивание через Ollama
 - Просмотр/поиск/удаление фактов и координат
-- Индексация проектов, управление File Watcher
+- Управление сессиями (создание, переименование, удаление)
 - Live настройка параметров (CCI порог, лимиты памяти)
 
 **Файл:** `static/index.html` (весь фронтенд в одном файле)
@@ -124,8 +136,8 @@ OrchestratorPipeline
     │       └── Да → Coordinator создаёт координату → сброс контекста
     │
     ├── Retriever: семантический поиск в WARM памяти
-    ├── Code Module: поиск релевантного кода (если активен)
-    ├── Сборка промпта: система + память + код + история + запрос
+    ├── Graph: поиск по Knowledge Graph (факты + связи)
+    ├── Сборка промпта: система + память + граф + история + запрос
     │
     ▼
 Dual Model Router
