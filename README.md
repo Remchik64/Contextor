@@ -1,348 +1,245 @@
 # 🧠 Contextor
 
-> **Local AI with unlimited memory — 85% fewer tokens, 100% recall, zero cloud**
+> **Local AI with hierarchical memory — управление контекстным окном вместо его обрезки**
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-green.svg)](https://python.org)
-[![GitHub](https://img.shields.io/badge/GitHub-Remchik64%2FContextor--pro-black.svg)](https://github.com/Remchik64/Contextor-pro)
-[![Support on Boosty](https://img.shields.io/badge/Support%20on-Boosty-orange.svg)](https://boosty.to/rem64)
+[![GitHub](https://img.shields.io/badge/GitHub-Remchik64%2FContextor-black.svg)](https://github.com/Remchik64/Contextor)
+[![Support on Boosty](https://img.shields.io/badge/Support%20on%20Boosty-orange.svg)](https://boosty.to/rem64)
 [![Support via YooMoney](https://img.shields.io/badge/Support-ЮMoney-blueviolet.svg)](https://yoomoney.ru/to/4100118846255337)
 
 ![Contextor Admin Panel](docs/images/admin-panel.png)
 
-Every LLM has a context limit. When conversation gets long, the model forgets, hallucinates, or breaks. Contextor solves this with **hierarchical memory** and **soft resets** — your AI remembers everything, conversations never degrade, and token usage drops by 85%.
+---
+
+## ⚠️ Текущее состояние проекта
+
+Этот README описывает **замысел**. Прежде чем пользоваться — прочитайте фактическое
+состояние, потому что часть механизмов не работает:
+
+| Документ | О чём |
+|---|---|
+| [`docs/JOURNAL.md`](docs/JOURNAL.md) | Что реально работает, что нет, хронология |
+| [`docs/known-issues.md`](docs/known-issues.md) | 40 проверенных проблем с `file:line` |
+| [`docs/architecture.md`](docs/architecture.md) | Архитектура по факту кода |
+| [`docs/installation.md`](docs/installation.md) | Установка и обходные пути |
+
+**Коротко:** 392 теста, 367 проходит, 25 падает; покрытие 49%. Сервер поднимается и
+отдаёт 27 маршрутов. Связка «координатор → генератор» реализована и работает.
+Но: **установщики ссылаются на переименованный репозиторий и отдают 404**, не-ASCII
+память повреждается при перезапуске, а `DELETE /api/v1/sessions/..` уничтожает весь
+`storage/` без аутентификации.
+
+Установка: используйте [ручной способ](docs/installation.md), не установщик.
 
 ---
 
-## ✨ What Makes Contextor Different
+## Проблема, которую решает Contextor
 
-### 🧠 Hierarchical Memory
+У любой LLM конечное контекстное окно. Когда разговор становится длинным, окно
+переполняется — и модель не обрывается, а **деградирует**: забывает начало, путает
+ранее принятые решения, начинает выдумывать.
 
-Contextor doesn't just stuff everything into context. It organizes knowledge in layers:
+Обычные подходы: обрезать историю (знания теряются) или ждать падения. Contextor
+пробует третье — **управлять контекстом, а не обрезать его**.
 
-| Layer | What | How it works |
-|-------|------|-------------|
-| **HOT** | Working Memory | Active facts with attention scoring — always in context |
-| **WARM** | Storage | Semi-active facts, semantic search via embeddings — recalled when relevant |
-| **Anchor** | Critical Facts | Information that never decays — names, preferences, key decisions |
+---
 
-Facts automatically flow between layers: important facts get promoted to HOT, irrelevant ones sink to WARM. Anchor facts always stay visible.
+## Как это устроено
 
-### 🎯 Soft Reset with Coordinates
+### Иерархическая память
 
-When context fills up, most systems either truncate history (losing information) or crash. Contextor does a **soft reset**:
+Факты хранятся в двух уровнях и на диске:
 
-1. A lightweight 3B model creates a **coordinate** — a compressed snapshot of the entire conversation (~200 tokens)
-2. Context clears, coordinate injected as the first message
-3. **100% recall across resets** — the model picks up exactly where it left off
+| Уровень | Что | Где физически |
+|---|---|---|
+| **HOT** | активные факты | список в оперативной памяти |
+| **WARM** | остальные факты | словарь в памяти + зеркало в JSON |
+| **ARCHIVED** | сжатые факты | значение уровня сжатия |
 
-No information loss. No degradation. Unlimited conversation length.
+> В предыдущей версии README здесь был третий уровень «Anchor» и утверждалось, что WARM
+> хранится в ChromaDB с эмбеддингами SentenceTransformer. Оба утверждения неверны:
+> «Anchor» — это булев флаг `is_anchor` на факте (`fact.py:53`), а WARM — обычный JSON-файл
+> (`storage.py:551`). ChromaDB используется только для индекса карточек кода, который
+> никогда не наполняется.
 
-### 📊 Context Coherence Index (CCI)
+### Сброс контекста через координату
 
-Contextor continuously monitors conversation health with CCI (0.0 → 1.0):
+Основная идея:
 
-- **CCI > 0.55** → conversation is coherent, proceed normally
-- **CCI < 0.55** → context is degrading, time for a soft reset
-- **Hard limit** → reset after 16 turns regardless of CCI
+1. окно заполняется;
+2. **координатор** — маленькая модель (~2B) — создаёт **координату**: сжатый снимок
+   того, что важно сохранить;
+3. история обрезается до последних нескольких сообщений;
+4. координата попадает в системный промпт;
+5. генератор продолжает разговор, уже не помня историю дословно.
 
-This means resets happen **when needed**, not on a fixed schedule.
+Порядок в коде именно такой, и он работает: координата создаётся
+(`orchestrator.py:345`) **до** сборки промпта (`:444`), поэтому генератор получает её в
+том же ходу, в котором контекст был сброшен. Детали — [`docs/architecture.md`](docs/architecture.md).
 
-### 🤖 Dual Model Architecture
+### Память не растёт с длиной сессии
 
-Contextor uses two models together for optimal quality and speed:
+Каждые 4 координаты сворачиваются в одну мета-координату, старые уходят в архив. В промпт
+всегда попадают только мета-координата и последняя активная
+(`meta_coordinator.py:144-167`), поэтому размер памяти постоянен при любой длине беседы.
 
-| Model | Size | Role | Speed |
-|-------|------|------|-------|
-| **Coordinator** | 2B | Intent detection, coordinates, fact extraction | ⚡ Fast |
-| **Generator** | 9B | High-quality response generation | 🧠 Smart |
+### Две модели, которые не знают друг о друге
 
-The coordinator handles all meta-tasks (what to remember, when to reset), while the generator focuses on producing excellent answers. This means the 9B model only runs when generating responses — saving VRAM and compute.
+| Роль | Размер | Задача |
+|---|---|---|
+| Coordinator | ~2B | координаты, извлечение фактов |
+| Generator | ~9B | только ответ пользователю |
 
-### 💾 Persistent Memory
+Вызываются независимыми HTTP-запросами без общего состояния (`dual_model.py:180-219`).
+Смысл разделения — экономия: большая модель включается только на генерации.
 
-All memory is **saved to disk**. Restart the server, and it remembers everything:
+---
 
-- Working memory facts survive restarts
-- Coordinate archive preserves every soft reset snapshot
-- Switch models anytime — memory is never lost
-- Each session has isolated storage
+## Производительность
 
-### 🖥️ Admin Panel
+> **Следующие числа не подтверждены.** В прежней версии README они подавались как факт.
+> Бенчмарки в репозитории их не измеряют: `benchmarks/runner.py` не подключён ни к тестам,
+> ни к CLI, ни к CI, а его «базовая линия» задана захардкоженными нулями
+> (`ISSUE-032` в [`docs/known-issues.md`](docs/known-issues.md)).
 
-Full web interface at `http://localhost:7860`:
+Что можно измерить честно и как это сделать — в
+[`docs/known-issues.md`](docs/known-issues.md) и [`docs/proxy/03-context-budget.md`](docs/proxy/03-context-budget.md).
 
-- **💬 Chat** — talk to your AI with full memory support
-- **🧠 Memory** — view, search, and manage facts and coordinates
-- **🤖 Models** — hardware detection, model recommendations, download
-- **⚙️ Settings** — live configuration (CCI threshold, memory limits)
-- **📋 Logs** — real-time server logs
+---
 
-### 🔌 OpenAI-Compatible API
+## Установка
+
+### Требования
+
+Python 3.11+, [Ollama](https://ollama.com). GPU необязателен.
+
+### Ручная установка (рекомендуется)
 
 ```bash
-POST /v1/chat/completions   # Standard OpenAI format
-GET  /v1/models              # Model list
-```
+# 1. Ollama
+curl -fsSL https://ollama.com/install.sh | sh      # Linux
+# Windows/macOS: https://ollama.com/download
 
-Any OpenAI-compatible client (curl, Python SDK, apps) connects instantly. Memory works transparently for every client.
+# 2. Код
+git clone https://github.com/Remchik64/Contextor.git
+cd Contextor
 
----
+# 3. Окружение
+python -m venv .venv
+source .venv/bin/activate        # Linux/macOS
+.\.venv\Scripts\activate         # Windows
 
-## 🚀 Quick Start
+# 4. Зависимости
+pip install -e .
+pip install psutil pyyaml        # не объявлены, но нужны
 
-### Option 1: Installer (Recommended)
-
-**Windows:**
-
-📥 [**Download install.bat**](https://raw.githubusercontent.com/Remchik64/Contextor-pro/main/install.bat) — or via PowerShell:
-
-```powershell
-Invoke-WebRequest -Uri https://raw.githubusercontent.com/Remchik64/Contextor-pro/main/install.bat -OutFile install.bat
-.\install.bat
-```
-
-**Linux / macOS:**
-```bash
-curl -fsSL https://raw.githubusercontent.com/Remchik64/Contextor-pro/main/install.sh | bash
-```
-
-The installer will:
-1. ✅ Check Python 3.11+
-2. ✅ Install Ollama automatically
-3. ✅ Install Contextor via pip
-4. ✅ Create desktop shortcut / launcher
-5. ✅ Launch the server and open browser
-
-### Option 2: Manual Installation
-
-```bash
-# 1. Install Ollama
-curl -fsSL https://ollama.com/install.sh | sh
-
-# 2. Install Contextor
-pip install git+https://github.com/Remchik64/Contextor-pro.git
-
-# 3. Start server
-contextor serve
-
-# 4. Open browser
-# http://localhost:7860
-```
-
-### First Run
-
-After installation, open `http://localhost:7860` and:
-1. Go to **🤖 Models** tab
-2. Click **"Detect Hardware"** — Contextor auto-detects your GPU
-3. See recommendations for your system
-4. Click **"Download"** to get recommended models
-5. Start chatting! 🎉
-
----
-
-## 📊 Performance
-
-| Metric | Without Memory | With Contextor |
-|--------|---------------|------------------|
-| Context tokens per turn | ~8000 | ~1200 |
-| Token reduction | baseline | **85% fewer** |
-| Recall after reset | 0% | **100%** |
-| Supported conversation length | ~50 turns | **Unlimited** |
-| Embedding speed | N/A | **5ms/fact (CUDA)** |
-
----
-
-## 🏗️ Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│                     Contextor                        │
-│                                                     │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────────┐  │
-│  │  Intent  │  │   CCI    │  │  Memory System   │  │
-│  │ Detector │  │ Tracker  │  │  HOT / WARM      │  │
-│  └────┬─────┘  └────┬─────┘  └────────┬─────────┘  │
-│       │              │                  │            │
-│  ┌────▼──────────────▼──────────────────▼─────────┐ │
-│  │              OrchestratorPipeline               │ │
-│  │  Soft Reset │ Coordinate │ Adaptive CCI Reset   │ │
-│  └────┬───────────────────────────────────────────┘ │
-│       │                                             │
-│  ┌────▼──────────────────────────────────────────┐ │
-│  │           Dual Model Router                   │ │
-│  │  Coordinator (2B) │ Generator (9B)            │ │
-│  └────┬──────────────────────────────────────────┘ │
-│       │                                             │
-│  ┌────▼──────────────────────────────────────────┐ │
-│  │  RAG │ Knowledge Graph │ Semantic Search        │ │
-│  └───────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────┘
-         │
-    Ollama (backend)
-```
-
----
-
-## 📁 Project Structure
-
-```
-contextor/
-├── src/contextor/
-│   ├── api/              # FastAPI routes, WebSocket
-│   ├── core/
-│   │   ├── memory/       # Fact, WorkingMemory, Storage, Scorer, Optimizer
-│   │   ├── orchestrator.py   # Main pipeline
-│   │   ├── dual_model.py     # 2B/9B router
-│   │   ├── intent.py         # Intent detection
-│   │   ├── card_generator.py # RAG card generation
-│   │   ├── retriever.py      # Semantic search
-│   │   ├── assembler.py      # Context assembly
-│   │   ├── graph.py          # Knowledge graph
-│   │   └── session_manager.py
-│   ├── engines/          # Ollama provider, config loader
-│   ├── utils/            # Hardware detector, tokenizer
-│   └── static/           # Admin Panel (index.html)
-├── tests/                # 370+ tests
-├── docs/                 # Documentation
-├── install.bat           # Windows installer
-├── install.sh            # Linux/macOS installer
-├── config.yaml           # Configuration
-└── pyproject.toml
-```
-
----
-
-## ⚙️ Configuration
-
-```yaml
-# config.yaml
-server:
-  host: 0.0.0.0
-  port: 7860
-
-coordinator:
-  model: qwen3.5:2b    # Fast model for navigation
-  temperature: 0.2
-  max_tokens: 400
-
-generator:
-  model: qwen3.5:9b    # Smart model for responses
-  temperature: 0.7
-  max_tokens: 2048
-
-memory:
-  context_window_messages: 12
-  keep_after_reset: 6
-  max_hot_facts: 50
-  adaptive_reset:
-    enabled: true
-    cci_threshold: 0.55
-    min_turns_between_resets: 4
-    max_turns_without_reset: 16
-
-cci:
-  window_size: 5
-  reset_threshold: 0.55
-```
-
----
-
-## 🔌 Integration
-
-### ✅ Ollama (Working)
-
-Contextor uses Ollama as the default backend. Install Ollama and pull models:
-
-```bash
-# Install Ollama
-curl -fsSL https://ollama.com/install.sh | sh
-
-# Pull recommended models
+# 5. Модели (имена из config.yaml)
 ollama pull qwen3.5:2b
 ollama pull qwen3.5:9b
 ollama pull nomic-embed-text
+
+# 6. Запуск
+python -m contextor serve --port 7860
 ```
 
-Any Ollama-compatible model works. The Admin Panel handles model detection and download.
+Откройте `http://localhost:7860`.
 
----
+> **Установщики `install.bat` / `install.sh` сейчас не работают:** они скачивают из
+> `Remchik64/Contextor-pro` — репозиторий переименован, и этот URL отдаёт **404**
+> (проверено запросом). Подробности — [`docs/installation.md`](docs/installation.md).
 
-## 🧪 Development
+### Конфигурация — важная особенность
+
+Файл `config.yaml` **в корне проекта может не читаться**: `%APPDATA%\Contextor\config.yaml`
+имеет приоритет над ним (`config_loader.py:118-153`). Какой файл используется фактически,
+показывает `GET /api/v1/config`. Чтобы задать свой явно:
 
 ```bash
-# Clone
-git clone https://github.com/Remchik64/Contextor-pro
-cd contextor
-
-# Setup
-python -m venv venv
-source venv/bin/activate  # Linux/macOS
-.\venv\Scripts\activate   # Windows
-pip install -e .
-
-# Run tests
-python -m pytest tests/ -q
-
-# Run server
-contextor serve --port 7860
+export PURE_INTELLECT_CONFIG="$PWD/config.yaml"     # имя переменной — историческое
 ```
 
----
-
-## 📈 Roadmap
-
-- [x] Hierarchical memory (HOT/WARM)
-- [x] Soft Reset with coordinates
-- [x] Context Coherence Index (CCI)
-- [x] Dual Model Router (2B coordinator + 9B generator)
-- [x] Semantic search with embeddings (CUDA)
-- [x] LLM-based importance tagging
-- [x] OpenAI-compatible API
-- [x] Multi-session support
-- [x] Admin Panel
-- [x] Hardware Detection + Model Recommendations
-- [x] Install Scripts (Windows/Linux/macOS)
-- [x] Persistent Memory Storage
-- [x] Knowledge Graph
-- [x] RAG card generation
-- [ ] PyPI package (`pip install contextor`)
-- [ ] Module Mode (transparent proxy for AI apps)
-- [ ] UCIP v2 (4-layer Context Package)
-- [ ] Adaptive CCI threshold
-- [ ] Docker image
+Часть ключей конфигурации не работает вовсе — полный список в
+[`ISSUE-017`](docs/known-issues.md).
 
 ---
 
-## 🤝 Contributing
+## CLI
 
-Contributions are welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Add tests for new functionality
-4. Ensure all tests pass
-5. Submit a Pull Request
+```bash
+contextor serve --port 7860     # запустить сервер
+contextor model list            # список моделей
+contextor model download <key>  # скачать модель
+```
+
+Команд ровно две: `serve` и `model`. Упоминавшаяся ранее `contextor config --show-path`
+не существует.
 
 ---
 
-## 📜 License
+## API
+
+OpenAI-совместимый интерфейс:
+
+```bash
+curl http://localhost:7860/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"contextor","messages":[{"role":"user","content":"Привет"}]}'
+```
+
+Полный список — 27 маршрутов плюс WebSocket `/ws` — в
+[`docs/api_reference.md`](docs/api_reference.md).
+
+> При использовании внешним клиентом помните: клиентское `system`-сообщение отключает
+> инжекцию памяти (`ISSUE-003`), а `stream: true` не стримит (`ISSUE-012`).
+
+---
+
+## Разработка
+
+```bash
+git clone https://github.com/Remchik64/Contextor.git
+cd Contextor
+python -m venv .venv && source .venv/bin/activate
+pip install -e .
+pip install pytest pytest-asyncio pytest-cov
+
+# тесты
+python -m pytest tests/ -q --ignore=tests/test_system_full.py
+# 367 passed, 25 failed — известное состояние (ISSUE-020)
+```
+
+`tests/test_system_full.py` через pytest запускать нельзя: это не тест, а скрипт с живыми
+HTTP-запросами на импорте, из-за которого сбор тестов зависает.
+
+Документация для разработчиков начинается с [`docs/README.md`](docs/README.md).
+
+---
+
+## Замысел дальше: прокси-режим
+
+Основное направление развития — превратить Contextor из самостоятельного чата в
+**прокси перед чужим движком**: пользователь поднимает `llama.cpp` со своей моделью, а
+Contextor становится её памятью и управляет контекстным окном. Тогда Contextor не тратит
+VRAM на генератор и заодно освобождает память под веса модели.
+
+Проработка — в [`docs/proxy/`](docs/proxy/). **В коде этого пока нет** (провайдер
+`llamacpp` закомментирован в `engines/provider.py:217-218`).
+
+---
+
+## Лицензия
 
 Copyright 2025 **Яраев Ренат Жавдетович**
 
 Licensed under the **Apache License, Version 2.0**.
 
-This license allows you to:
-- ✅ Use commercially
-- ✅ Modify and distribute
-- ✅ Patent use
-- ✅ Private use
+Разрешает: коммерческое использование, изменение и распространение, патентное
+использование, приватное использование.
 
-With conditions:
-- 📋 License and copyright notice must be included
-- 📋 State changes made to the code
-- 📋 Original author attribution required
+Условия: сохранение лицензии и копирайта, указание внесённых изменений, атрибуция автора.
 
-See [LICENSE](LICENSE) for full terms.
+Полные условия — [LICENSE](LICENSE).
 
 ---
 
@@ -352,7 +249,7 @@ See [LICENSE](LICENSE) for full terms.
 
 *Built with ❤️ by Ренат Яраев (Remchik64)*
 
-[GitHub](https://github.com/Remchik64/Contextor-pro) · [Issues](https://github.com/Remchik64/Contextor-pro/issues) · [License](LICENSE) · [VK](https://vk.com/remchik64) · [Boosty](https://boosty.to/rem64) · [ЮMoney](https://yoomoney.ru/to/4100118846255337)
+[GitHub](https://github.com/Remchik64/Contextor) · [Issues](https://github.com/Remchik64/Contextor/issues) · [License](LICENSE) · [VK](https://vk.com/remchik64) · [Boosty](https://boosty.to/rem64) · [ЮMoney](https://yoomoney.ru/to/4100118846255337)
 
 📧 renataraev51@gmail.com · remch2013@yandex.ru
 

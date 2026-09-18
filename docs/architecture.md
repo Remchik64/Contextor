@@ -1,276 +1,431 @@
-# 🏗️ Contextor — Architecture
+# Архитектура Contextor
 
-> Честное описание архитектуры для разработчиков. Здесь написано как есть, без маркетинга.
+> **Переписано заново 2026-09-18** по фактическому коду, HEAD `dd36774`.
+> Предыдущая версия начиналась словами «Честное описание архитектуры… как есть, без
+> маркетинга» и при этом содержала ложные утверждения: ChromaDB как хранилище WARM,
+> несуществующий слой COLD (`core/archive.py`), «cosine similarity» для CCI,
+> несуществующий Dashboard, «465 тестов проходят». Архивирована.
+>
+> **Проблемы:** `docs/known-issues.md` · **Хронология:** `docs/JOURNAL.md` ·
+> **Проработка прокси-режима:** `docs/proxy/`
 
----
-
-## Общая идея
-
-Contextor решает фундаментальную проблему LLM: **деградация контекста при длинных разговорах**.
-
-Обычный чат: контекст заполняется → модель «забывает» начало разговора → качество ответов падает.
-
-Contextor: контекст заполняется → система создаёт **координату** (сжатый снимок памяти) → контекст обнуляется → координата инжектируется в новый контекст → разговор продолжается без потери смысла.
-
----
-
-## Компоненты системы
-
-### 1. Иерархическая память (✅ Рабочая)
-
-Трёхуровневая система хранения фактов:
-
-```
-HOT (WorkingMemory)          — активные факты в RAM
-  ↓  eviction при переполнении
-WARM (MemoryStorage)         — ChromaDB + SentenceTransformer embeddings
-  ↓  архивация старых фактов
-COLD (Archive)               — сжатые исторические данные
-```
-
-**Файлы:** `core/memory/` — `WorkingMemory`, `MemoryStorage`, `Scorer`, `Optimizer`
-
-Каждый факт имеет:
-- `text` — содержание
-- `importance` — скор важности (0.0–1.0)
-- `access_count` — количество обращений
-- `is_anchor` — критический факт, никогда не удаляется
-- `last_accessed` — время последнего доступа
-
-**Smart Eviction:** когда HOT переполнен (> `hot_facts_max`), факты с низким скором перемещаются в WARM. Anchor Facts защищены.
-
-### 2. Soft Reset + Координата (✅ Рабочая)
-
-Самая важная фича системы:
-
-1. Диалог достигает порога (CCI < 0.55 или turns ≥ 16)
-2. Coordinator (3B модель) создаёт **координату** — сжатый снимок всего что важно
-3. История чата обнуляется
-4. Координата инжектируется как первое сообщение в новом контексте
-5. Пользователь этого не замечает — разговор продолжается
-
-**Файл:** `core/orchestrator.py` — `OrchestratorPipeline`
-
-### 3. Context Coherence Index (CCI) (✅ Рабочий)
-
-Metric (0.0–1.0) которая отслеживает смысловую связность диалога в реальном времени.
-
-Алгоритм:
-- Cosine similarity между последними N сообщениями
-- Скользящее среднее по окну
-- Падение CCI → предиктор деградации контекста
-
-Порог по умолчанию: `0.55`. При CCI < порога + turns ≥ 4 → мягкий сброс.
-
-**Файл:** `core/orchestrator.py`
-
-### 4. Dual Model Router (✅ Рабочий)
-
-Два класса задач — два разных размера модели:
-
-| Задача | Модель | Почему |
-|--------|--------|--------|
-| Навигация, создание координат, intent detection | Coordinator (3B) | Скорость |
-| Генерация ответов пользователю | Generator (7B+) | Качество |
-
-Модели независимы, переключаются без перезапуска сервера.
-
-**Файл:** `core/dual_model.py`
-
-### 5. Memory Subsystem (✅ Рабочая)
-
-Полная подсистема памяти в `core/memory/`:
-
-- **WorkingMemory** — HOT буфер, активные факты (importance-weighted)
-- **MemoryStorage** — WARM долгосрочное хранилище (ChromaDB + embeddings)
-- **Scorer** (`scorer.py`) — AttentionScorer: считает важность фактов
-- **Tagger** (`tagger.py`) — ImportanceTagger: LLM-классификация фактов (anchors / facts / transient)
-- **MetaCoordinator** (`meta_coordinator.py`) — управляет ростом координат (каждые 4 → мета-координата)
-- **Optimizer** (`optimizer.py`) — фоновый промоут/compress/archive
-- **Fact** (`fact.py`) — атом памяти с attention_weight + is_anchor + stability
-- **CCI Tracker** (`cci.py`) — Context Coherence Index
-
-Каждый факт защищён `is_anchor` от eviction. Facts имеют жизненный цикл RAW → SUMMARIZED → ENTITY_ONLY → ARCHIVED.
-
-### 6. Parsers & Knowledge Graph (✅ Рабочий)
-
-- `core/graph.py` + `core/graph_builder.py` — Knowledge Graph
-- `parsers/python_parser.py` (tree-sitter-based) парсит Python код в CodeEntity + CodeCard
-- `core/card_generator.py` генерирует карточки кода
-
-### 7. OpenAI-Compatible API (✅ Рабочий)
-
-Сервер принимает запросы в стандартном OpenAI формате:
-- `POST /v1/chat/completions` — основной эндпоинт
-- `GET /v1/models` — список моделей
-
-Любой клиент который умеет работать с OpenAI API — подключится.
-
-**Файлы:** `api/routes.py`, `api/websocket.py`, `api/schemas.py`
-
-### 7. Admin Panel (✅ Рабочий)
-
-Полный веб-интерфейс на `http://localhost:7860`:
-- Dashboard с GPU/CCI/память метриками в реалтайм
-- Управление моделями, скачивание через Ollama
-- Просмотр/поиск/удаление фактов и координат
-- Управление сессиями (создание, переименование, удаление)
-- Live настройка параметров (CCI порог, лимиты памяти)
-
-**Файл:** `static/index.html` (весь фронтенд в одном файле)
+Здесь описано **как есть**. Где функция не работает — это указано. Где чего-то нет —
+тоже указано.
 
 ---
 
-## Поток данных
+## 1. Что это такое по факту кода
 
-```
-Пользователь
-    │
-    ▼
-POST /v1/chat/completions
-    │
-    ▼
-OrchestratorPipeline
-    ├── Проверка CCI → нужен ли Soft Reset?
-    │       │
-    │       └── Да → Coordinator создаёт координату → сброс контекста
-    │
-    ├── Retriever: семантический поиск в WARM памяти
-    ├── Graph: поиск по Knowledge Graph (факты + связи)
-    ├── Сборка промпта: система + память + граф + история + запрос
-    │
-    ▼
-Dual Model Router
-    ├── Generator (7B) → генерация ответа
-    └── Coordinator (3B) → навигационные задачи
-    │
-    ▼
-Ответ → Memory Extractor
-    ├── Извлечение новых фактов из диалога
-    └── Сохранение в HOT память
-    │
-    ▼
-Ответ пользователю (streaming)
-```
+Contextor — локальный оркестратор, который управляет контекстным окном LLM через
+иерархическую память и периодический сброс контекста.
+
+Проблема: у LLM конечное окно. При длинном разговоре окно переполняется, и модель
+деградирует — забывает начало, путает решения. Contextor пытается не обрезать историю, а
+**сжимать её в компактную «координату»** и подмешивать эту координату в промпт.
+
+В коде это реализовано как **самостоятельный чат-сервер со своим буфером**. Замысел
+прокси перед чужим движком (Module Mode) в коде отсутствует.
 
 ---
 
-## 💾 Персистентное хранилище
+## 2. Топология по факту
 
-Это одна из ключевых уникальных характеристик Contextor: **вся память сохраняется на диске**.
+```
+┌──────────────────────────────────────────────────────────────┐
+│  FastAPI (server.py, 255 строк)                               │
+│    /            → static/index.html                           │
+│    /api/v1/*    → 27 маршрутов (server.py:38)                  │
+│    /v1/*        → OpenAI-совместимые (server.py:39)            │
+│    /ws          → WebSocket (server.py:42)                     │
+└───────┬──────────────────────────────────────────────────────┘
+        │
+┌───────▼──────────────────────────────────────────────────────┐
+│  OrchestratorPipeline (core/orchestrator.py, 928 строк)       │
+│    intent → retrieve → graph → prompt → generate → memory      │
+└───────┬──────────────────────────────────────────────────────┘
+        │
+┌───────▼──────────────────┐   ┌────────────────────────────────┐
+│  DualModelRouter          │   │  Память                        │
+│  (core/dual_model.py)     │   │  WorkingMemory — список в RAM  │
+│   coordinator  2B         │   │  MemoryStorage — словарь в RAM │
+│   generator    9B         │   │  MetaCoordinator — координаты  │
+│   utility      9B         │   │  + зеркало на диск (JSON)      │
+└───────┬──────────────────┘   └────────────────────────────────┘
+        │ HTTP /v1/chat/completions
+┌───────▼──────────────────────────────────────────────────────┐
+│  Ollama (внешний процесс, по умолчанию localhost:11434)        │
+└──────────────────────────────────────────────────────────────┘
+```
 
-### Структура хранилища
+**Хранилище — не база данных.** `MemoryStorage` держит факты в обычном словаре в
+оперативной памяти (`core/memory/storage.py:205`) и зеркалит его в один JSON-файл
+(`:551`). ChromaDB используется **только** для индекса карточек кода
+(`core/retriever.py:68-75`), который никогда не наполняется. Утверждение прежней
+документации «WARM = ChromaDB + SentenceTransformer» неверно.
+
+---
+
+## 3. Пара «координатор + генератор» — ядро замысла
+
+Это главный механизм, и он **реализован**. Порядок вызовов внутри одного хода
+(`core/orchestrator.py`):
+
+| Строка | Действие |
+|---|---|
+| `:332` | текущий запрос добавляется в историю |
+| `:335` | `cci_tracker.evaluate(query)` — оценка связности |
+| `:342` | `_should_soft_reset(score)` — решение о сбросе |
+| **`:345`** | **`_soft_reset()`** — координатор строит координату |
+| `:234` | история обрезается до последних 6 сообщений |
+| `:364` | определение intent (регулярки) |
+| `:382` | поиск карточек кода |
+| `:401` | поиск по графу (падает, ошибка глушится — `ISSUE-006`) |
+| `:412-438` | utility-воркер для web_search / read_document |
+| **`:444`** | `system_prompt = system or _build_system_prompt(...)` |
+| `:451` | `_build_messages()` — сборка `messages[]` |
+| **`:460`** | **`_generate()` → генератор** |
+| `:469` | ответ добавляется в историю |
+| `:492` | сохранение сессии |
+| `:521-575` | tagger → рабочая память → оптимизатор |
+
+Ключевое: **координата создаётся до сборки промпта**, поэтому генератор получает её в
+том же ходу, в котором контекст был сброшен.
+
+### Две модели независимы
+
+`DualModelRouter` (`core/dual_model.py`) вызывает обе через отдельные HTTP-запросы и не
+передаёт между ними состояния:
+
+```python
+# core/dual_model.py:221-248 — координатор
+def coordinate(self, messages, temperature=0.1, max_tokens=512):
+    content, pt, ct = self._call_ollama(messages=messages,
+                                        model=self.coordinator_model, ...)
+
+# core/dual_model.py:250-290 — генератор
+def generate(self, messages, temperature=0.7, max_tokens=2048):
+    model = self.generator_model if self._check_generator_available() else self.coordinator_model
+```
+
+Координатор — **чистая функция** от переданных сообщений: он не помнит предыдущих
+вызовов. Генератор о существовании координатора не знает. Оба ходят в
+`{ollama_url}/v1/chat/completions` (`:180-219`).
+
+### Как координата попадает к генератору
+
+```python
+# core/orchestrator.py:704-708
+meta_context = self._meta_coordinator.get_context_for_prompt()
+if meta_context:
+    parts.append("\n## Координаты сессии:")
+    parts.append(meta_context)
+
+# core/orchestrator.py:710-714
+memory_context = self.working_memory.get_context(max_tokens=400)
+if memory_context:
+    parts.append("\n## Контекст из памяти:")
+    parts.append(memory_context)
+```
+
+Координата попадает в **системный промпт**, а не первым сообщением — прежняя
+документация утверждала обратное.
+
+### Как память не растёт с длиной сессии
+
+`MetaCoordinator` (`core/memory/meta_coordinator.py`) решает задачу постоянного размера:
+
+1. каждый сброс → `add_coordinate()` (`:97`), координата идёт в `_active`;
+2. при `len(_active) >= 4` → `needs_meta()` истинно (`:111`);
+3. оркестратор строит мета-координату, `consolidate()` (`:113-142`) архивирует активные
+   в `coordinate_archive/batch_<timestamp>.json` и оставляет одну мета;
+4. `get_context_for_prompt()` (`:144-167`) отдаёт **мету + последнюю активную**.
+
+Размер памяти, уходящей в промпт, постоянен при любой длине беседы — в докстроке
+заявлено ~600 токенов. Обратная сторона: до 3 промежуточных координат в промпт не
+попадают.
+
+### Отказ координатора
+
+```python
+# core/orchestrator.py:196-198 — скриптовый fallback
+key_messages = [m for m in chat_history if m["role"] == "user"][-3:]
+return "Контекст разговора: " + " | ".join(m["content"][:100] for m in key_messages)
+```
+
+Если координатор вернул пусто (`dual_model.py:246-248`), координата собирается
+конкатенацией последних трёх пользовательских сообщений. Модель для этого не нужна.
+
+### Поведение сброса на практике
+
+Триггеры (`core/orchestrator.py:285-315`): `turns >= 16` → безусловно;
+`len(chat_history) > 12` → переполнение истории; `cci < 0.55 и turns >= 4` → по связности.
+Все три значения **захардкожены**.
+
+Так как переполнение проверяется по 12 **сообщениям**, а не по токенам, при сжатии
+истории до 6 сообщений порог снова достигается через 3 хода — то есть «адаптивный» сброс
+на практике работает как расписание с периодом 4 хода (`ISSUE-005`).
+
+### Ключевое ограничение
+
+```python
+# core/orchestrator.py:444
+system_prompt = system or self._build_system_prompt(intent, context_cards, graph_entities)
+```
+
+Если клиент прислал `system`-сообщение (а так делают все OpenAI-совместимые клиенты),
+`_build_system_prompt` **не вызывается** — координаты, факты, карточки и граф в промпт не
+попадают. `ISSUE-003`.
+
+---
+
+## 4. Подсистема памяти
+
+| Компонент | Файл | Строк | Назначение | Состояние |
+|---|---|---:|---|---|
+| `Fact` | `memory/fact.py` | 141 | единица знания: `content`, `attention_weight`, `is_anchor` | Работает |
+| `WorkingMemory` | `memory/working_memory.py` | 396 | список фактов в RAM, бюджет токенов, decay | Работает, с дефектами |
+| `MemoryStorage` | `memory/storage.py` | 588 | словарь фактов в RAM + зеркало на диск | Работает, с дефектами |
+| `Scorer` | `memory/scorer.py` | 170 | вес внимания | Работает |
+| `Optimizer` | `memory/optimizer.py` | 235 | сжатие и архивация холодных фактов | **Уничтожает содержимое** (`ISSUE-008`) |
+| `ImportanceTagger` | `memory/tagger.py` | 248 | извлечение фактов моделью | Залипает на regex-fallback (`ISSUE-015`) |
+| `CCITracker` | `memory/cci.py` | 279 | метрика связности | **Не может сработать** (`ISSUE-004`) |
+| `MetaCoordinator` | `memory/meta_coordinator.py` | 254 | жизненный цикл координат | Работает |
+
+### Слои: что есть на самом деле
+
+В коде:
+
+| Слой документации | Что в коде |
+|---|---|
+| HOT | `WorkingMemory._facts` — список в RAM (`working_memory.py:49`) |
+| WARM | `MemoryStorage._facts` — словарь в RAM + JSON-зеркало (`storage.py:205,551`) |
+| Anchor | **не слой**, а булев флаг `Fact.is_anchor` (`fact.py:53`) на факте в том же HOT-списке |
+| COLD | значение `CompressionLevel.ARCHIVED` (`fact.py:22`) |
+
+Слоя «Anchor» как отдельного хранилища не существует. Гарантия «никогда не удаляется» не
+выполняется: `_evict_to_budget()` (`working_memory.py:380-389`) выбирает факт по
+минимальному весу без проверки `is_anchor` (`ISSUE-007`).
+
+### Где живут данные
 
 ```
 storage/
-├── sessions/
-│   └── <session_id>/          # Отдельная папка для каждой сессии
-│       ├── working_memory.json    # HOT память — активные факты
-│       ├── storage.json           # WARM память — факты в ожидании
-│       ├── chat_history.json      # Полная история диалога
-│       ├── session_meta.json      # Метаданные сессии (CCI, turn count)
-│       └── coordinate_archive/   # Архив всех координат (soft reset снимки)
-│           ├── coord_001.json
-│           ├── coord_002.json
-│           └── ...               # Бессрочно хранится вся история
-└── chromadb/
-    └── chroma.sqlite3            # Семантическая база данных (WARM память)
+├── chromadb/            # индекс карточек кода — никогда не наполняется
+└── sessions/
+    └── <session_id>/
+        ├── working_memory.json     # HOT-факты
+        ├── storage.json            # WARM-факты
+        ├── chat_history.json       # история беседы
+        ├── session_meta.json       # метаданные
+        └── coordinate_archive/     # архивированные координаты (batch_*.json)
 ```
 
-### Расположение на диске
+Путь `storage/sessions` **захардкожен** относительно текущего каталога
+(`orchestrator.py:107,112`). `settings.storage_dir` и `settings.chroma_dir` существуют, но
+используются для одной строки лога (`server.py:242`).
 
-| Способ установки | Путь к storage |
-|-----------------|----------------|
-| Windows (installer, install.bat) | `Desktop\storage\` и `Desktop\models\` (рядом с `start.bat`) |
-| Linux / macOS / dev install | `./storage/` от рабочей директории |
+`session_meta.json` пишут два разных класса (`core/session.py:63` и
+`core/session_manager.py:94`), причём `save()` перезаписывает его без `display_name` —
+имена чатов не сохраняются (`ISSUE-026`).
 
-### Почему это важно
+### Контур подкачки фактов не работает
 
-**Перезапуск не = потеря памяти.** При каждом запуске сервер автоматически подгружает предыдущую сессию из JSON файлов и chromadb. Пользователь продолжает разговор с того места где остановился.
+`MemoryStorage.retrieve()` имеет ровно один вызов вне тестов — `orchestrator.py:357`,
+внутри `if coherence_result.needs_context_restore():`. Предикат всегда `False`
+(`ISSUE-004`), поэтому факты из хранилища в окно никогда не подкачиваются.
 
-**Смена модели не = потеря памяти.** Факты хранятся независимо от модели — текстом и эмбеддингами. Поменяли модель в config.yaml → та же память доступна сразу.
-
-**Coordinate Archive — полная история soft reset.** Каждый раз когда система выполняет soft reset, создаётся координата (coord_NNN.json) и сохраняется в `coordinate_archive/` навсегда. Это означает что спустя месяцы работы можно восстановить любой момент истории разговоров.
-
-**Мульти-сессионность.** Разные проекты, разные темы — разные `session_id`. Каждый получает свою изолированную папку со своей историей и памятью.
-
----
-
-## Что требует доработки
-
-> Эта секция важна. Не скрываем проблемные места.
-
-### 🚧 Интеграции с внешними инструментами
-
-**Agent Zero** — интеграция в разработке.
-
-Архитектурная задача нетривиальна:
-- Наивный подход (проксировать LLM запросы через CTX) **не работает** — ломает внутренний GEN/EXE цикл Agent Zero, портит JSON ответы модели, создаёт «fake dialogs» которые сбивают модель
-- Правильный подход: переписать только файлы памяти в Agent Zero (`memory.py`) чтобы они вызывали CTX REST API — Agent Zero работает со своей моделью напрямую, CTX обеспечивает только иерархическую память
-- Статус: архитектурное решение найдено, реализация предстоит
-
-**LM Studio** — provider не реализован. В `config.yaml` можно прописать `provider: lmstudio`, но стабильная работа не гарантирована.
-
-**Open WebUI** — интеграция не тестировалась.
-
-### 🚧 Компоненты в процессе доработки
-
-| Компонент | Файл | Статус |
-|-----------|------|--------|
-| Graph Memory | `core/graph.py`, `core/graph_builder.py` | Реализован, интеграция неполная |
-| Card Generator | `core/card_generator.py` | Экспериментальный |
-| Retriever | `core/retriever.py` | Работает, возможна оптимизация |
-| Assembler | `core/assembler.py` | Работает, возможна оптимизация |
-| Archive (COLD) | `core/archive.py` | Базовая реализация |
-
-### 🚧 Инфраструктура
-
-- **PyPI пакет** — не опубликован, установка только через `pip install git+...`
-- **Docker image** — не создан
-- **CI/CD** — нет автоматических проверок при PR
+Это **не** затрагивает цепочку координат из раздела 3 — она работает независимо.
 
 ---
 
-## Конфигурация
+## 5. Граф и RAG
 
-Главный файл: `config.yaml` в корне проекта.
+| Компонент | Файл | Строк | Состояние |
+|---|---|---:|---|
+| `KnowledgeGraph` | `core/graph.py` | 128 | Не используется |
+| `GraphBuilder` | `core/graph_builder.py` | 137 | `build_from_directory` без вызовов; `storage/graph.json` отсутствует |
+| `Retriever` | `core/retriever.py` | 199 | Вызывается, но коллекция пуста |
+| `CardGenerator` | `core/card_generator.py` | 214 | Создаётся (`orchestrator.py:70`) и не используется |
+| `ContextAssembler` | `core/assembler.py` | 162 | Достижим только из мёртвого `run_stream()` |
 
-```yaml
-server:
-  host: 0.0.0.0
-  port: 7860
+Два дефекта, делающих эти подсистемы бесполезными:
 
-coordinator:
-  model: qwen2.5:3b    # Рекомендуем qwen3:2b для лучшего качества
-
-generator:
-  model: qwen2.5:7b    # Любая модель через Ollama
-  num_gpu: -1          # -1 = auto, 0 = CPU, N = N слоёв на GPU
-
-memory:
-  hot_facts_max: 50
-  soft_reset_turns: 8
-  adaptive_reset:
-    enabled: true
-    cci_threshold: 0.55
-    min_turns: 4
-    hard_limit_turns: 16
-
-cci:
-  window_size: 5
-  reset_threshold: 0.55
+```python
+# core/orchestrator.py:401 — метода не существует
+results = self.graph_builder.search_nodes(entity, limit=3)
+# GraphBuilder.search_nodes → False ; GraphBuilder.search → True  (ISSUE-006)
+```
+```python
+# core/orchestrator.py:679 — карточки читаются не с теми полями
+entity = getattr(card, 'entity', None)          # а в RetrievalResult поля плоские
+name = getattr(entity, 'name', 'Unknown')       # → всегда 'Unknown'  (ISSUE-013)
 ```
 
 ---
 
-## Тесты
+## 6. Триада моделей
 
-```bash
-# Быстрые unit тесты (не требуют запущенного Ollama)
-python -m pytest tests/ -q   --ignore=tests/test_live_memory.py   --ignore=tests/test_system_full.py
+| Роль | Модель по умолчанию | Где используется |
+|---|---|---|
+| Coordinator | `qwen3.5:2b` | `DualModelRouter.coordinate()` (`dual_model.py:234`); `ImportanceTagger` (`tagger.py:27` — жёстко зашито) |
+| Generator | `qwen3.5:9b` | `DualModelRouter.generate()` (`:262`) |
+| Utility | `qwen3.5:9b` | `core/utility_worker.py` — web_search, read_document |
+| Embedder | `nomic-embed-text` | `storage.py:154` (через HTTP Ollama) |
 
-# Все тесты (требуют запущенный Ollama + модели)
-python -m pytest tests/ -q
+**Обе основные модели грузятся резидентно.** При старте `server.py:204-228` считает, влезут
+ли обе с 25% запасом, и если да — грузит с `keep_alive: -1`:
+
+```python
+# server.py:224
+json={"model": model, "prompt": "", "keep_alive": -1}
 ```
 
-465 тестов проходят стабильно.
+Механизм для обратного — выгрузка координатора и возврат по требованию — написан
+(`utils/swap_manager.py:113,132` `acquire_coordinator` / `release_coordinator`) и
+**не вызывается ниоткуда**. Из модуля используются только `acquire_utility` /
+`release_utility`, и то лишь в `core/utility_worker.py:125,140`.
+
+### Имя модели в ответе недостоверно
+
+```python
+# core/orchestrator.py:753-764
+def _generate(self, messages, model_key, temperature, max_tokens):
+    text, p, c = self._router.generate(messages=messages, ...)
+    # model_key принимается и не передаётся в роутер
+```
+
+`_select_model()` возвращает ключи реестра (`:651,653`), а генерирует модель из конфига
+роутера. `OrchestrationResult.model_used` сообщает не ту модель (`ISSUE-023`).
+
+---
+
+## 7. Пайплайн ответа и стриминг
+
+Стриминга нет ни в одном из четырёх мест (`ISSUE-012`):
+
+| Путь | Что происходит |
+|---|---|
+| WebSocket `/ws` | `pipeline.run()` целиком, затем ответ режется по пробелам с `asyncio.sleep(0)` (`api/websocket.py:217-226`) |
+| OpenAI SSE | `_sse_stream()` с докстрокой `Fake SSE streaming` (`api/system.py:322-341`) |
+| OpenAI прокси-путь | захардкожено `"stream": False` (`api/system.py:388`) |
+| `run_stream()` | Написан (`orchestrator.py:580`), ноль вызовов |
+
+Синхронный `pipe.run()` вызывается внутри `async def` (`api/system.py:412`), блокируя цикл
+событий на всё время генерации (`ISSUE-024`).
+
+---
+
+## 8. Конфигурация
+
+Две независимые системы:
+
+| Система | Источник | Что читает |
+|---|---|---|
+| `engines/config_loader.py` | `config.yaml` | модели, `num_ctx`, часть ключей памяти |
+| `config.py` (pydantic-settings) | env `CONTEXTOR_*` + `.env` | `host`, `port`, `ollama_url` |
+
+**Порядок поиска `config.yaml`** (`config_loader.py:118-153`): env `PURE_INTELLECT_CONFIG` →
+`%APPDATA%\Contextor\config.yaml` → `~/.config/contextor/` → текущий каталог → корень
+проекта → `/etc`. AppData имеет приоритет над репозиторием, поэтому **репозиторный
+`config.yaml` может не читаться вообще** (`ISSUE-016`).
+
+**Живые ключи:** `models.*`, `memory.num_ctx`, `memory.meta_coordinate_every`.
+**Мёртвые:** вся секция `memory.adaptive_reset.*` (не парсится), `memory.context_window_messages`,
+`memory.keep_after_reset`, `memory.working_memory_tokens`, `memory.max_storage_facts`,
+`models.utility`, `server.*`, `ollama.*`. Полный разбор — `ISSUE-017`.
+
+Отдельная деталь: имя переменной окружения `PURE_INTELLECT_CONFIG` осталось от прежнего
+названия проекта «Чистый Интеллект» и не соответствует префиксу `CONTEXTOR_` в `config.py:92`.
+
+---
+
+## 9. HTTP-поверхность
+
+27 маршрутов в OpenAPI, плюс два скрытых (`include_in_schema=False`), WebSocket и
+статический каталог. Полное описание — `docs/api_reference.md`. Здесь — группы:
+
+| Группа | Префикс | Назначение |
+|---|---|---|
+| Система | `/api/v1` | health, config, settings, hardware, logs, version |
+| Чат | `/api/v1/chat` | ответ через пайплайн |
+| Сессии | `/api/v1/sessions/*`, `/session/*` | список, создание, переключение, история |
+| Память | `/api/v1/memory/*` | stats, facts, clear |
+| Модели | `/api/v1/models/*`, `/ollama/models` | статус, переключение, скачивание, удаление |
+| Диагностика | `/api/v1/cci/stats`, `/dual-model/stats` | метрики |
+| OpenAI | `/v1/models`, `/v1/chat/completions` | совместимый API |
+| WebSocket | `/ws` | чат-поток |
+
+Эндпоинты `GET /memory/search`, `POST /memory/fact`, `DELETE /memory/clear` (реально
+только POST), `WS /ws/chat` из прежней документации **не существуют**.
+
+---
+
+## 10. Инвентарь кода
+
+54 файла, 9748 строк в `src/`. Крупнейшие:
+
+| Файл | Строк | Роль |
+|---|---:|---|
+| `core/orchestrator.py` | 928 | главный пайплайн, сброс, координаты |
+| `core/memory/storage.py` | 588 | WARM-хранилище |
+| `api/system.py` | 457 | системный API + OpenAI-совместимый |
+| `utils/hardware_detector.py` | 401 | определение GPU и рекомендации |
+| `core/session_manager.py` | 400 | управление сессиями |
+| `core/memory/working_memory.py` | 396 | HOT-буфер |
+| `api/websocket.py` | 358 | WebSocket |
+| `core/dual_model.py` | 345 | маршрутизация моделей |
+| `api/models_api.py` | 310 | управление моделями |
+| `core/intent.py` | 308 | определение намерения |
+| `engines/provider.py` | 297 | фабрика провайдеров |
+| `engines/config_loader.py` | 292 | загрузка конфигурации |
+| `core/memory/cci.py` | 279 | метрика связности |
+| `server.py` | 255 | FastAPI-приложение |
+| `core/memory/meta_coordinator.py` | 254 | жизненный цикл координат |
+
+### Мёртвый код
+
+Есть в дереве, не вызывается ниоткуда:
+
+- `core/summarizer.py` (121) — **не импортируется нигде**; коллабораторы
+  (`archive.get_pairs`, `set_summary`, `trim_pairs`) отсутствуют, `core/archive.py` удалён
+  в `5aa4777`. Содержит скриптовый (`_simple_compress`) и модельный (`_llm_compress`) пути
+  построения памяти;
+- `core/orchestrator.py:580` `run_stream()`, `:919` `_auto_name_session_if_first()`;
+- `core/orchestrator.py:70` `self.card_generator`, `:83` `self._scorer`;
+- `utils/tokenizer.py:22` `fit_messages_budget()` — готовая обрезка под бюджет токенов;
+- `utils/swap_manager.py:113,132` `acquire_coordinator` / `release_coordinator`;
+- `core/assembler.py:154` `assemble_and_respond()`;
+- `core/intent.py:164-199` `detect_llm()` — требует `model_manager.loaded_model`, который не загружается;
+- `engines/ollama.py` `OllamaEngine`, `engines/provider.py` `ProviderFactory` — вне живого пути;
+- `engine/` (ед. ч., 213 строк) — legacy llama-cpp стек; достигается из `__main__.py:8` и
+  косвенно через `api/state.py:7`, то есть по HTTP тоже достижим.
+
+---
+
+## 11. Чего в коде нет
+
+Перечислено, чтобы это не появилось в документации снова как существующее.
+
+| Заявлено в архивной документации | Факт |
+|---|---|
+| UCIP v2, 4-слойный Context Package | Отсутствует. Есть один слой `[RELEVANT CODE CONTEXT]` (`retriever.py:187`) |
+| Module Mode, Decision Engine, Context Surgery | Отсутствует полностью |
+| Dashboard с метриками GPU/CCI | Отсутствует. Вкладок пять: Chat, Memory, Models, Settings, Logs |
+| `core/archive.py` как слой COLD | Файла нет |
+| `docs/ROADMAP.md` | Файла нет |
+| CLI `contextor config --show-path` | Команд только две: `model`, `serve` |
+| «85% fewer tokens», «100% recall», «5ms/fact» | Ничем не измеряются (`ISSUE-032`) |
+| «465 тестов проходят» | 367 passed, 25 failed |
+
+---
+
+## 12. Границы применимости
+
+Что проект делает: управляет контекстным окном **своей** беседы в собственном чат-сервере,
+сжимая историю в координаты через вторую, маленькую модель.
+
+Что он не делает: не выступает прокси перед чужим движком, не обслуживает внешние
+приложения прозрачно, не работает с `llama.cpp` (провайдер `llamacpp` закомментирован в
+`engines/provider.py:217-218`), не хранит семантический индекс фактов, не стримит ответ.
+
+Проработка перехода к прокси-режиму — в `docs/proxy/`.
